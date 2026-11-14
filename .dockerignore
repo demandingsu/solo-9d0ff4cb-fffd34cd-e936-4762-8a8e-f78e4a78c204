@@ -1,0 +1,10 @@
+.venv
+.pydeps
+__pycache__
+*.pyc
+.pytest_cache
+data
+.git
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
