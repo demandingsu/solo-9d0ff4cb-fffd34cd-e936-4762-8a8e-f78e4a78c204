@@ -18,7 +18,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import Iterable, List
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -155,6 +155,27 @@ class FileManager:
         with self._ref_lock:
             for r in refs:
                 key = r.path.name
+                count = self._refs.get(key, 0)
+                if count <= 1:
+                    self._refs.pop(key, None)
+                else:
+                    self._refs[key] = count - 1
+
+    def pin_files(self, paths: Iterable[Path]) -> None:
+        """Pin arbitrary files so the reaper cannot unlink them mid-read.
+
+        Used by the replay feed, which resolves files through merge lineage
+        rather than through a station/day snapshot.
+        """
+        with self._ref_lock:
+            for p in paths:
+                key = p.name
+                self._refs[key] = self._refs.get(key, 0) + 1
+
+    def unpin_files(self, paths: Iterable[Path]) -> None:
+        with self._ref_lock:
+            for p in paths:
+                key = p.name
                 count = self._refs.get(key, 0)
                 if count <= 1:
                     self._refs.pop(key, None)

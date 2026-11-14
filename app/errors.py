@@ -26,3 +26,15 @@ class MergeFailedError(StorageError):
 
 class NotFoundError(StorageError):
     status_code = 404
+
+
+class CursorError(StorageError):
+    """A pull cursor is malformed, belongs to another station, or is out of range."""
+
+    status_code = 400
+
+
+class PullReadError(StorageError):
+    """Published files could not be read consistently; the same cursor may be retried."""
+
+    status_code = 503

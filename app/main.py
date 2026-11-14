@@ -7,7 +7,7 @@ from typing import List, Optional
 from fastapi import FastAPI, File, HTTPException, Path as PathParam, Query, UploadFile
 from pydantic import BaseModel
 
-from . import db, services
+from . import db, replay, services
 from .config import settings
 from .errors import StorageError
 from .storage import file_manager
@@ -70,6 +70,23 @@ class ListBatchesResponse(BaseModel):
     station_id: str
     day: str
     batches: List[BatchInfo]
+
+
+class PulledBatch(BaseModel):
+    seq: int
+    batch_id: str
+    day: str
+    row_count: int
+    records: List[RainRecord]
+
+
+class PullResponse(BaseModel):
+    station_id: str
+    round_bound: int
+    round_complete: bool
+    batch_count: int
+    batches: List[PulledBatch]
+    next_cursor: str
 
 
 # ---------------------------------------------------------------- app setup
@@ -185,3 +202,28 @@ def get_batches(
 @app.post("/admin/reap", tags=["ops"], summary="Force reaping of unreferenced superseded files")
 def force_reap() -> dict:
     return services.force_reap()
+
+
+@app.get(
+    "/stations/{station_id}/pull",
+    response_model=PullResponse,
+    tags=["pull"],
+    summary="Incrementally pull original upload batches in ingestion order",
+    description=(
+        "Replay feed for a downstream sink: pages of original uploads "
+        "(merges are not new uploads) in ingestion order. Each round fixes "
+        "its ingestion upper bound at request start; when the bound is "
+        "reached, `next_cursor` opens a new round that includes later "
+        "uploads. Retrying with the same cursor returns the same page, even "
+        "after the original batches were merged and their files reaped. A "
+        "read failure returns 503 with no partial page and no new cursor."
+    ),
+)
+def pull_station(
+    station_id: str = STATION_PATH,
+    cursor: Optional[str] = Query(
+        None, description="opaque continuation cursor from a previous page"
+    ),
+    limit: int = Query(1, ge=1, le=100, description="max batches per page"),
+) -> PullResponse:
+    return PullResponse(**replay.pull_batches(station_id, cursor, limit))

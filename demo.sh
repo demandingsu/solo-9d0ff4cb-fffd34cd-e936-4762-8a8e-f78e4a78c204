@@ -69,3 +69,81 @@ curl -fsS "${BASE_URL}/stations/${STATION}/days/${DAY}/batches" \
 import sys, json
 for b in json.load(sys.stdin)['batches']:
     print(f\"  {b['batch_id']}  status={b['status']:<10} file_exists={b['file_exists']}\")"
+
+# ---------------------------------------------------------------------------
+# Incremental pull: resume from the confirmed batch after merge + cleanup.
+# ---------------------------------------------------------------------------
+PULL_STATION="ST900"
+DEMO_TMP="$(mktemp -d)"
+trap 'rm -rf "${DEMO_TMP}"' EXIT
+
+cat > "${DEMO_TMP}/p1.csv" <<CSV
+station_id,obs_time,rain_mm
+${PULL_STATION},2026-11-12T00:00Z,0.0
+${PULL_STATION},2026-11-12T00:01Z,0.2
+CSV
+cat > "${DEMO_TMP}/p2.csv" <<CSV
+station_id,obs_time,rain_mm
+${PULL_STATION},2026-11-12T08:00Z,1.1
+${PULL_STATION},2026-11-12T08:01Z,2.4
+${PULL_STATION},2026-11-12T08:01Z,2.4
+CSV
+cat > "${DEMO_TMP}/p3.csv" <<CSV
+station_id,obs_time,rain_mm
+${PULL_STATION},2026-11-12T23:00Z,9.9
+CSV
+
+jget() { python3 -c "import sys, json; print(json.load(sys.stdin)$1)"; }
+
+echo; echo "### 7. incremental pull: upload two batches, pull page 1 (round bound fixed)"
+curl -fsS -X POST -F "file=@${DEMO_TMP}/p1.csv" \
+  "${BASE_URL}/stations/${PULL_STATION}/days/${DAY}/batches" | pp
+curl -fsS -X POST -F "file=@${DEMO_TMP}/p2.csv" \
+  "${BASE_URL}/stations/${PULL_STATION}/days/${DAY}/batches" | pp
+
+PAGE1="$(curl -fsS "${BASE_URL}/stations/${PULL_STATION}/pull")"
+echo "page 1:"; echo "${PAGE1}" | pp
+CURSOR1="$(echo "${PAGE1}" | jget "['next_cursor']")"
+PAGE2="$(curl -fsS "${BASE_URL}/stations/${PULL_STATION}/pull?cursor=${CURSOR1}")"
+echo "page 2 (round completes, cursor opens the next round):"
+echo "${PAGE2}" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print(json.dumps({'round_bound': d['round_bound'], 'round_complete': d['round_complete'],
+                  'batch_ids': [b['batch_id'] for b in d['batches']]}, indent=2))"
+CURSOR2="$(echo "${PAGE2}" | jget "['next_cursor']")"
+
+echo; echo "### 8. merge + reap: the original Parquet files are deleted"
+curl -fsS -X POST "${BASE_URL}/stations/${PULL_STATION}/days/${DAY}/merge" \
+  | python3 -c "import sys, json; d=json.load(sys.stdin); print('merged_batch_id:', d['merged_batch_id'], ' sources:', d['source_batch_ids'])"
+curl -fsS -X POST "${BASE_URL}/admin/reap" | pp
+curl -fsS "${BASE_URL}/stations/${PULL_STATION}/days/${DAY}/batches" \
+  | python3 -c "
+import sys, json
+for b in json.load(sys.stdin)['batches']:
+    print(f\"  {b['batch_id']}  status={b['status']:<10} file_exists={b['file_exists']}\")"
+
+echo; echo "### 9. resume with the pre-merge cursor: rows recovered from the merged file"
+RETRY2="$(curl -fsS "${BASE_URL}/stations/${PULL_STATION}/pull?cursor=${CURSOR1}")"
+if [ "${RETRY2}" = "${PAGE2}" ]; then
+  echo "OK: same cursor returned an identical page after merge+cleanup"
+else
+  echo "MISMATCH between pre/post-merge pages"; exit 1
+fi
+echo "${RETRY2}" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+for b in d['batches']:
+    print(f\"  batch {b['batch_id']} rows={b['row_count']}\")
+    for r in b['records']:
+        print(f\"    {r['obs_time']}  rain={r['rain_mm']}  source={r['source_batch_id']}\")"
+
+echo; echo "### 10. new upload lands after the round; next round from the confirmed cursor sees only it"
+curl -fsS -X POST -F "file=@${DEMO_TMP}/p3.csv" \
+  "${BASE_URL}/stations/${PULL_STATION}/days/${DAY}/batches" | pp
+curl -fsS "${BASE_URL}/stations/${PULL_STATION}/pull?cursor=${CURSOR2}" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print(json.dumps({'round_bound': d['round_bound'], 'round_complete': d['round_complete'],
+                  'batch_ids': [b['batch_id'] for b in d['batches']],
+                  'obs_times': [r['obs_time'] for b in d['batches'] for r in b['records']]}, indent=2))"
